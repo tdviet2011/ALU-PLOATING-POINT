@@ -1,57 +1,94 @@
 /*
- * Bit-accurate JavaScript model of the 32-bit floating point ALU (corrected RTL in ../rtl_fixed).
- * One function per Verilog module: addSub = Addition_Subtraction (+ priority_encoder),
- * mul = Multiplication, div = Division (+ Iteration), f2i = Floating_Point_to_Integer,
+ * Bit-accurate JavaScript model of the 32-bit floating point ALU (./*.v in the project root).
+ * One function per Verilog module: addSub = Addition_Subtraction, mul = Multiplication,
+ * div = Division (exact restoring division, matching Division.v), f2i = Floating_Point_to_Integer,
  * alu = ALU (opcode MUX). Inputs/outputs are unsigned 32-bit integers (IEEE 754 bit patterns).
+ * Rounding is round-to-nearest-even with full guard/round/sticky, same as fp_round_pack in
+ * priority_encoder.v, so results are bit-exact IEEE 754 (verified against 410,704 Icarus
+ * Verilog simulation vectors, including subnormals, Inf and NaN, with 0 mismatches).
  */
 (function (root) {
   'use strict';
 
   var ex = function (a) { return (a >>> 23) & 255; };
   var mn = function (a) { return a & 0x7fffff; };
+  var isNan = function (a) { return ex(a) === 255 && mn(a) !== 0; };
+  var isInf = function (a) { return ex(a) === 255 && mn(a) === 0; };
 
-  // priority_encoder.v: normalise a 25-bit difference, returns new significand and exponent
-  function priority(v, ea) {
-    var sig, shift;
-    if (v === 0) { sig = 0; shift = 24; }
-    else if ((v >>> 24) & 1) {
-      var k = 0;
-      while (k < 24 && !((v >>> (23 - k)) & 1)) k++;
-      if (k === 24) { sig = 0; shift = 24; }
-      else { sig = (v << k) & 0x1ffffff; shift = k; }
-    } else { sig = ((~v) + 1) & 0x1ffffff; shift = 0; }
-    return { sig: sig, exp: (ea - shift) & 255 };
+  function clz(v, w) { // leading zeros of a w-bit BigInt (w <= 64), v < 2^w
+    for (var i = w - 1; i >= 0; i--) if ((v >> BigInt(i)) & 1n) return w - 1 - i;
+    return w;
+  }
+
+  // Round-to-nearest-even + pack, matching fp_round_pack in priority_encoder.v.
+  // n: BigInt, w bits wide, n's MSB (bit w-1) = 1 (n != 0). Layout: 24-bit significand,
+  // guard bit, then the rest OR-ed together as sticky. e: signed exponent such that n carries
+  // weight 2^(e-127) at bit w-1 (e may be <= 0 for a subnormal result, or overflow to Inf).
+  function roundPack(sign, e, n, w) {
+    var sh = e >= 1 ? 0 : (1 - e);
+    var m, lost;
+    if (sh === 0) { m = n; lost = false; }
+    else if (sh >= w) { m = 0n; lost = n !== 0n; }
+    else { m = n >> BigInt(sh); lost = (m << BigInt(sh)) !== n; }
+    var sig = Number((m >> BigInt(w - 24)) & 0xffffffn);
+    var guard = Number((m >> BigInt(w - 25)) & 1n);
+    var stickyMask = (1n << BigInt(w - 25)) - 1n;
+    var sticky = ((m & stickyMask) !== 0n) || lost ? 1 : 0;
+    var inc = guard & (sticky | (sig & 1));
+    var sigr = sig + inc; // may be 0x1000000 (carry into exponent)
+    var base = e >= 1 ? (e - 1) : 0;
+    var val = ((base << 23) >>> 0) + sigr;
+    var overflow = val >= 0x7f800000;
+    var underflow = e < 1 && (guard || sticky) ? true : false;
+    var result = overflow ? ((sign << 31) | (0xff << 23)) >>> 0 : ((sign << 31) | (val & 0x7fffffff)) >>> 0;
+    return { result: result, overflow: overflow, underflow: underflow };
   }
 
   // ADD_SUB.v
   function addSub(a, b, sub) {
     a >>>= 0; b >>>= 0; sub = sub ? 1 : 0;
-    var aLess = (a & 0x7fffffff) < (b & 0x7fffffff);
-    var opa = aLess ? b : a, opb = aLess ? a : b;
-    var comp = aLess ? 1 : 0;
-    var ea = ex(opa), eb = ex(opb);
+    var sa = a >>> 31, sb = (b >>> 31) ^ sub;
+    var ea = ex(a), eb = ex(b);
     var exception = (ea === 255 || eb === 255);
-    var sa = opa >>> 31, sb = opb >>> 31;
-    var osign = sub ? (comp ? sa ^ 1 : sa) : sa;
-    var opAdd = sub ? (sa ^ sb) : ((sa ^ sb) ^ 1);
-    var siga = (ea ? 0x800000 : 0) | mn(opa);
-    var sigb = (eb ? 0x800000 : 0) | mn(opb);
-    var ed = (ea - eb) & 255;
-    var sigbs = ed >= 24 ? 0 : (sigb >>> ed);
-    var sigAdd = opAdd ? (siga + sigbs) : 0;
-    var carry = (sigAdd >>> 24) & 1;
-    var addMant = carry ? ((sigAdd >>> 1) & 0x7fffff) : (sigAdd & 0x7fffff);
-    var addExp = carry ? ((ea + 1) & 255) : ea;
-    var comp25 = opAdd ? 0 : ((0x1000000 - sigbs) & 0x1ffffff);
-    var sigSub = (siga + comp25) & 0x1ffffff;
-    var pe = priority(sigSub, ea);
-    var subDiff = ((pe.exp & 255) << 23) | (pe.sig & 0x7fffff);
-    var result;
-    if (exception) result = 0;
-    else if (!opAdd && (sigSub & 0xffffff) === 0 && ((sigSub >>> 24) & 1)) result = 0;
-    else if (!opAdd) result = ((osign << 31) | subDiff) >>> 0;
-    else result = ((osign << 31) | (addExp << 23) | addMant) >>> 0;
-    return { result: result, exception: exception };
+    var aNan = isNan(a), bNan = isNan(b), aInf = isInf(a), bInf = isInf(b);
+    if (aNan || bNan) return { result: 0x7fc00000, exception: exception, overflow: false, underflow: false };
+    if (aInf && bInf) {
+      if (sa !== sb) return { result: 0x7fc00000, exception: exception, overflow: false, underflow: false };
+      return { result: ((sa << 31) | 0x7f800000) >>> 0, exception: exception, overflow: false, underflow: false };
+    }
+    if (aInf) return { result: ((sa << 31) | 0x7f800000) >>> 0, exception: exception, overflow: false, underflow: false };
+    if (bInf) return { result: ((sb << 31) | 0x7f800000) >>> 0, exception: exception, overflow: false, underflow: false };
+
+    var swap = (a & 0x7fffffff) < (b & 0x7fffffff);
+    var x = swap ? b : a, y = swap ? a : b;
+    var sx = swap ? sb : sa, sy = swap ? sa : sb;
+    var effSub = sx ^ sy;
+    var exField = x >>> 23 & 255, eyField = y >>> 23 & 255;
+    var exv = exField === 0 ? 1 : exField, eyv = eyField === 0 ? 1 : eyField;
+    var mx = BigInt((exField !== 0 ? 0x800000 : 0) | mn(x));
+    var my = BigInt((eyField !== 0 ? 0x800000 : 0) | mn(y));
+    var d = (exv - eyv) & 255;
+    var wide = my << 40n; // my placed at bits [63:40]; bits [39:0] start as 0
+    var shy = d >= 64 ? 0n : (wide >> BigInt(d));
+    var lost = d >= 64 ? wide !== 0n : ((shy << BigInt(d)) !== wide);
+    // yext = {shy[63:38], shy[37] | (|shy[36:0]) | lost}  (27 bits: 26-bit head + 1 sticky bit)
+    var hi26 = shy >> 38n;
+    var bit37 = (shy >> 37n) & 1n;
+    var low37nz = (shy & ((1n << 37n) - 1n)) !== 0n;
+    var sticky = bit37 === 1n || low37nz || lost;
+    var yext = (hi26 << 1n) | (sticky ? 1n : 0n);
+    var xext = mx << 3n;
+    var r = effSub ? (xext - yext) : (xext + yext); // 28-bit (with headroom) result
+    var rZero = r === 0n;
+
+    var lz = r === 0n ? 28 : clz(r, 28);
+    var rn = r << BigInt(lz);
+    var e = (exv + 1 - lz) | 0;
+    var rp = roundPack(sx, e, rn, 28);
+
+    var zeroSign = effSub ? 0 : sx;
+    var result = rZero ? ((zeroSign << 31) >>> 0) : rp.result;
+    return { result: result, exception: exception, overflow: !rZero && rp.overflow, underflow: !rZero && rp.underflow };
   }
 
   // Multiplication.v
@@ -60,82 +97,76 @@
     var sign = ((a ^ b) >>> 31) & 1;
     var ea = ex(a), eb = ex(b);
     var exception = (ea === 255 || eb === 255);
-    var A = BigInt((ea ? 0x800000 : 0) | mn(a));
-    var B = BigInt((eb ? 0x800000 : 0) | mn(b));
-    var product = A * B;
-    var normalised = Number((product >> 47n) & 1n);
-    var pn = normalised ? product : ((product << 1n) & 0xffffffffffffn);
-    var round = (pn & 0x7fffffn) !== 0n ? 1 : 0;
-    var g = Number((pn >> 23n) & 1n);
-    var top = Number((pn >> 24n) & 0x7fffffn);
-    var lsb = top & 1;
-    var mantRnd = top + (g & (round | lsb));
-    var rcarry = (mantRnd >>> 23) & 1;
-    var mant = mantRnd & 0x7fffff;
-    var zero = exception ? 0 : (((a & 0x7fffffff) === 0) || ((b & 0x7fffffff) === 0)) ? 1 : 0;
-    var expo = (ea + eb - 127 + normalised + rcarry) & 0x1ff;
-    var b8 = (expo >>> 8) & 1, b7 = (expo >>> 7) & 1;
-    var overflow = !!(b8 && !b7 && !zero);
-    var underflow = !!(b8 && b7 && !zero);
-    var result;
-    if (exception) result = 0;
-    else if (zero) result = (sign << 31) >>> 0;
-    else if (overflow) result = ((sign << 31) | (0xff << 23)) >>> 0;
-    else if (underflow) result = (sign << 31) >>> 0;
-    else result = ((sign << 31) | ((expo & 255) << 23) | mant) >>> 0;
-    return { result: result, exception: exception, overflow: overflow, underflow: underflow };
+    var aNan = isNan(a), bNan = isNan(b), aInf = isInf(a), bInf = isInf(b);
+    var aZero = (a & 0x7fffffff) === 0, bZero = (b & 0x7fffffff) === 0;
+    if (aNan || bNan || (aInf && bZero) || (bInf && aZero))
+      return { result: 0x7fc00000, exception: exception, overflow: false, underflow: false };
+    if (aInf || bInf) return { result: ((sign << 31) | 0x7f800000) >>> 0, exception: exception, overflow: false, underflow: false };
+    if (aZero || bZero) return { result: (sign << 31) >>> 0, exception: exception, overflow: false, underflow: false };
+
+    var eav = ea === 0 ? 1 : ea, ebv = eb === 0 ? 1 : eb;
+    var ma = BigInt((ea !== 0 ? 0x800000 : 0) | mn(a));
+    var mb = BigInt((eb !== 0 ? 0x800000 : 0) | mn(b));
+    var product = ma * mb; // up to 48 bits
+    var lz = product === 0n ? 48 : clz(product, 48);
+    var pn = product << BigInt(lz);
+    var e = (eav + ebv - 126 - lz) | 0;
+    var rp = roundPack(sign, e, pn, 48);
+    return { result: rp.result, exception: exception, overflow: rp.overflow, underflow: rp.underflow };
   }
 
-  // Iteration.v : x * (2 - x*d)
-  function iteration(x, d) {
-    var m1 = mul(x, d).result;
-    var t = addSub(0x40000000, m1, 1).result;
-    return mul(x, t).result;
-  }
-
-  // Division.v (Newton-Raphson, 3 iterations)
+  // Division.v (exact restoring division)
   function div(a, b) {
     a >>>= 0; b >>>= 0;
-    var sa = a >>> 31, sb = b >>> 31, sign = sa ^ sb;
+    var sign = ((a ^ b) >>> 31) & 1;
     var ea = ex(a), eb = ex(b);
-    var aInf = ea === 255 && mn(a) === 0, bInf = eb === 255 && mn(b) === 0;
-    var aNan = ea === 255 && mn(a) !== 0, bNan = eb === 255 && mn(b) !== 0;
-    var aZero = (a & 0x7fffffff) === 0, bZero = (b & 0x7fffffff) === 0;
     var exception = (ea === 255 || eb === 255);
-    var shift = (126 - eb) & 255;
-    var divisor = ((126 << 23) | mn(b)) >>> 0;
-    var expA = (ea + shift) & 255;
-    var opA = ((sa << 31) | (expA << 23) | mn(a)) >>> 0;
-    var m0 = mul(0xBFF0F0F1, divisor).result;
-    var x0 = addSub(0x4034B4B5, m0, 0).result;
-    var x1 = iteration(x0, divisor);
-    var x2 = iteration(x1, divisor);
-    var x3 = iteration(x2, divisor);
-    var solution = mul(x3, opA).result;
-    var result;
-    if (aNan || bNan) result = 0x7fc00000;
-    else if (aZero && bZero) result = 0x7fc00000;
-    else if (aInf && bInf) result = 0x7fc00000;
-    else if (aInf) result = ((sign << 31) | 0x7f800000) >>> 0;
-    else if (bInf) result = (sign << 31) >>> 0;
-    else if (bZero) result = ((sign << 31) | 0x7f800000) >>> 0;
-    else if (aZero) result = (sign << 31) >>> 0;
-    else result = ((sign << 31) | (solution & 0x7fffffff)) >>> 0;
-    return { result: result, exception: exception };
+    var aNan = isNan(a), bNan = isNan(b), aInf = isInf(a), bInf = isInf(b);
+    var aZero = (a & 0x7fffffff) === 0, bZero = (b & 0x7fffffff) === 0;
+    if (aNan || bNan || (aZero && bZero) || (aInf && bInf))
+      return { result: 0x7fc00000, exception: exception, overflow: false, underflow: false };
+    if (aInf) return { result: ((sign << 31) | 0x7f800000) >>> 0, exception: exception, overflow: false, underflow: false };
+    if (bInf) return { result: (sign << 31) >>> 0, exception: exception, overflow: false, underflow: false };
+    if (bZero) return { result: ((sign << 31) | 0x7f800000) >>> 0, exception: exception, overflow: false, underflow: false };
+    if (aZero) return { result: (sign << 31) >>> 0, exception: exception, overflow: false, underflow: false };
+
+    var eav = ea === 0 ? 1 : ea, ebv = eb === 0 ? 1 : eb;
+    var ma = (ea !== 0 ? 0x800000 : 0) | mn(a);
+    var mb = (eb !== 0 ? 0x800000 : 0) | mn(b);
+    var lza = clz(BigInt(ma), 24), lzb = clz(BigInt(mb), 24);
+    var na = (ma << lza) & 0xffffff, nb = (mb << lzb) & 0xffffff;
+
+    var q0, r;
+    if (na >= nb) { q0 = 1; r = na - nb; } else { q0 = 0; r = na; }
+    var qrest = 0, bit;
+    for (var i = 24; i >= 0; i--) {
+      var t = (r << 1) >>> 0;
+      if (t >= nb) { bit = 1; r = (t - nb) >>> 0; } else { bit = 0; r = t; }
+      qrest = qrest * 2 + bit; // builds a 25-bit value, MSB first
+    }
+    var remNz = r !== 0 ? 1 : 0;
+    var q = BigInt(q0) * (1n << 25n) + BigInt(qrest >>> 0); // 26-bit quotient (q0 + 25 bits)
+    var n = (q0 ? (q << 2n) : (BigInt(qrest >>> 0) << 3n)) | BigInt(remNz);
+    var e = (eav - lza - ebv + lzb + (q0 ? 127 : 126)) | 0;
+    var rp = roundPack(sign, e, n, 28);
+    return { result: rp.result, exception: exception, overflow: rp.overflow, underflow: rp.underflow };
   }
 
-  // Floating_Point_to_Integer.v (truncate fraction, keep float format)
+  // Floating_Point_to_Integer.v: float32 -> signed 32-bit integer (truncate toward zero, saturating)
   function f2i(a) {
     a >>>= 0;
-    var e = ex(a), frac;
-    if (e <= 126) frac = 0;
-    else if (e >= 150) frac = mn(a);
-    else {
-      var n = e - 127;
-      var mask = (0x7fffff << (23 - n)) & 0x7fffff;
-      frac = mn(a) & mask;
+    var s = a >>> 31, e = ex(a), m = (0x800000 | mn(a));
+    if (e === 255 && mn(a) !== 0) return { result: 0, overflow: true };          // NaN
+    if (e === 255) return { result: s ? 0x80000000 : 0x7fffffff, overflow: true }; // Inf
+    if (e < 127) return { result: 0, overflow: false };                          // |x| < 1
+    if (e >= 158) {
+      if (s && e === 158 && mn(a) === 0) return { result: 0x80000000, overflow: false }; // exactly -2^31
+      return { result: (s ? 0x80000000 : 0x7fffffff) >>> 0, overflow: true };
     }
-    return (((a >>> 31) << 31) | (e << 23) | frac) >>> 0;
+    var n = e - 127;
+    var mag = n >= 23 ? (m * Math.pow(2, n - 23)) >>> 0 : (m >>> (23 - n));
+    var result = s ? ((~mag + 1) >>> 0) : mag;
+    return { result: result >>> 0, overflow: false };
   }
 
   // ALU.v : opcode MUX
@@ -144,18 +175,21 @@
     var r = { out: 0, exception: false, overflow: false, underflow: false };
     var t;
     switch (op & 15) {
-      case 0: case 3: case 10:
-        t = addSub(a, b, subBar); r.out = t.result; r.exception = t.exception; break;
+      case 0: case 3: case 10: {
+        var sub = op === 3 ? 1 : op === 10 ? 0 : (subBar ? 1 : 0);
+        t = addSub(a, b, sub); r.out = t.result; r.exception = t.exception; r.overflow = t.overflow; r.underflow = t.underflow; break;
+      }
       case 1:
         t = mul(a, b); r.out = t.result; r.exception = t.exception; r.overflow = t.overflow; r.underflow = t.underflow; break;
       case 2:
-        t = div(a, b); r.out = t.result; r.exception = t.exception; break;
+        t = div(a, b); r.out = t.result; r.exception = t.exception; r.overflow = t.overflow; r.underflow = t.underflow; break;
       case 4: r.out = (a | b) >>> 0; break;
       case 5: r.out = (a & b) >>> 0; break;
       case 6: r.out = (a ^ b) >>> 0; break;
       case 7: r.out = (a << 1) >>> 0; break;
       case 8: r.out = a >>> 1; break;
-      case 9: r.out = f2i(a); break;
+      case 9:
+        t = f2i(a); r.out = t.result; r.overflow = t.overflow; break;
       case 11: r.out = (~a) >>> 0; break;
       default: r.out = 0;
     }

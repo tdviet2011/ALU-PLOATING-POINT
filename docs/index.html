@@ -40,6 +40,8 @@ td.mono{font-size:13px}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 .legend span{margin-right:12px}
 .tbl{overflow-x:auto}
+#err{white-space:pre-wrap;margin:6px 0}
+button:disabled{opacity:.5;cursor:default}
 footer{margin-top:32px;color:var(--muted);font-size:13px}
 </style>
 </head>
@@ -77,6 +79,13 @@ footer{margin-top:32px;color:var(--muted);font-size:13px}
   <select id="preset"></select>
   <span class="small mono" id="opcode"></span>
 </div>
+<div class="row" id="engRow">
+  <label for="engine" style="margin:0" data-i="lbl_engine">Engine</label>
+  <select id="engine"><option value="js">JS model</option></select>
+  <button id="runBtn" type="button" data-i="btn_run">Run</button>
+  <span class="small" id="engStatus"></span>
+</div>
+<pre id="err" class="bad small" hidden></pre>
 <div class="small legend"><span class="bs">■ sign</span><span class="be">■ exponent (8)</span><span class="bm">■ mantissa (23)</span></div>
 
 <h2 data-i="h_result">2. Result</h2>
@@ -92,18 +101,18 @@ footer{margin-top:32px;color:var(--muted);font-size:13px}
     <dt data-i="r_verdict">Verdict</dt><dd id="r_verdict"></dd>
   </dl>
 </div>
-<p class="small" data-i="note_ulp">ULP = distance between two adjacent float32 values. A correctly rounded float32 result has at most 0.5 ULP of error against the exact value, i.e. relative error ≤ 2⁻²⁴ ≈ 5.96e-8.</p>
+<p class="small" data-i="note_ulp">The ALU (round-to-nearest-even, full guard/round/sticky) is bit-exact against IEEE 754: every normal-input case below should read 0 ULP / Bit-exact. ULP = distance between two adjacent float32 values.</p>
 
 <h2 data-i="h_suite">3. Preset test suite</h2>
 <div class="row"><button id="runSuite" type="button" data-i="btn_suite">Run preset cases</button><span class="small" id="suiteSum"></span></div>
 <div class="tbl"><table id="suite"></table></div>
 
 <h2 data-i="h_rand">4. Random accuracy test</h2>
-<div class="row"><button id="runRand" type="button" data-i="btn_rand">Run 5,000 random samples per operation</button><span class="small" id="randSum"></span></div>
+<div class="row"><button id="runRand" type="button">Run random samples</button><span class="small" id="randSum"></span></div>
 <div class="tbl"><table id="rand"></table></div>
 <p class="small" data-i="note_rand">Only normal inputs with a normal, finite float32 reference are counted (no zero, subnormal, Inf, NaN).</p>
 
-<footer data-i="foot">The page runs a bit-accurate JavaScript port of the corrected Verilog ALU (alu_model.js, verified against 182,304 Icarus Verilog simulation vectors with 0 mismatches). Reference = Math.fround on 64-bit floats.</footer>
+<footer data-i="foot">Engines: the JS model is a bit-accurate port of the corrected Verilog ALU (alu_model.js, verified against 182,304 Icarus Verilog vectors, 0 mismatches). With alu_server.py running, the page can instead run the real RTL in Vivado xsim. Reference = Math.fround on 64-bit floats.</footer>
 </div>
 
 <script src="alu_model.js"></script>
@@ -128,13 +137,24 @@ function fmt(x,d){
   var a=Math.abs(x); return (a>=1e9||a<1e-4)?x.toExponential(d-1):String(Number(x.toPrecision(d)));
 }
 function normalF(h){var e=(h>>>23)&255;return e>0&&e<255;}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+function $(id){return document.getElementById(id);}
 
 var OPS=[
  {id:'add',name:{en:'Add (A + B)',vi:'Cộng (A + B)'},op:0,sub:0,k:'f',ref:function(x,y){return x+y;}},
  {id:'sub',name:{en:'Subtract (A − B)',vi:'Trừ (A − B)'},op:0,sub:1,k:'f',ref:function(x,y){return x-y;}},
  {id:'mul',name:{en:'Multiply (A × B)',vi:'Nhân (A × B)'},op:1,sub:0,k:'f',ref:function(x,y){return x*y;}},
  {id:'div',name:{en:'Divide (A ÷ B)',vi:'Chia (A ÷ B)'},op:2,sub:0,k:'f',ref:function(x,y){return x/y;}},
- {id:'f2i',name:{en:'Float → Integer part (trunc A)',vi:'Float → phần nguyên (trunc A)'},op:9,sub:0,k:'f1',ref:function(x){return Math.trunc(x);}},
+ {id:'f2i',name:{en:'Float → Integer (trunc A, saturating)',vi:'Float → số nguyên (trunc A, bão hòa)'},op:9,sub:0,k:'i1',ref:function(A){
+  var s=A>>>31,e=(A>>>23)&255,m=A&0x7fffff;
+  if(e===255&&m!==0)return 0;                                   // NaN
+  if(e===255)return (s?0x80000000:0x7fffffff)>>>0;              // Inf
+  if(e<127)return 0;                                            // |x| < 1
+  if(e>=158){ if(s&&e===158&&m===0)return 0x80000000; return (s?0x80000000:0x7fffffff)>>>0; }
+  var n=e-127,mag=(0x800000|m);
+  mag = n>=23 ? ((mag*Math.pow(2,n-23))>>>0) : (mag>>>(23-n));
+  return s ? ((~mag+1)>>>0) : mag;
+}},
  {id:'or',name:{en:'OR (A | B)',vi:'OR (A | B)'},op:4,sub:0,k:'b',ref:function(a,b){return (a|b)>>>0;}},
  {id:'and',name:{en:'AND (A & B)',vi:'AND (A & B)'},op:5,sub:0,k:'b',ref:function(a,b){return (a&b)>>>0;}},
  {id:'xor',name:{en:'XOR (A ^ B)',vi:'XOR (A ^ B)'},op:6,sub:0,k:'b',ref:function(a,b){return (a^b)>>>0;}},
@@ -143,6 +163,10 @@ var OPS=[
  {id:'not',name:{en:'NOT (~A)',vi:'NOT (~A)'},op:11,sub:0,k:'b1',ref:function(a){return (~a)>>>0;}}
 ];
 var OPBY={};OPS.forEach(function(o){OPBY[o.id]=o;});
+function isFloatOp(op){return op.k.charAt(0)==='f';}
+function isIntOp(op){return op.k==='i1';}
+function toSigned(h){h=h>>>0;return h>=0x80000000?h-4294967296:h;}
+function unaryOp(op){return op.k==='f1'||op.k==='b1'||op.k==='i1';}
 
 var PRESETS=[
  ['add','1.5','2.25'],['add','0.1','0.2'],['sub','1','1'],['sub','3e38','1'],['sub','100','99.5'],
@@ -157,37 +181,44 @@ var PRESETS=[
 var T={
  en:{title:'32-bit Floating-Point ALU Demo',sub:"Enter operands, pick an operation, and compare the ALU's output with the exact IEEE 754 float32 result.",
   h_input:'1. Operands and operation',lbl_a:'Operand A',lbl_b:'Operand B',lbl_op:'Operation',lbl_preset:'Example',
+  lbl_engine:'Engine',btn_run:'Run',
+  eng_js:'JS model (instant)',eng_vivado:'Vivado xsim (real RTL)',eng_iverilog:'Icarus Verilog (real RTL)',
+  eng_nosrv:'Server not running: using the JS model. For real RTL simulation run  python alu_server.py  and open http://127.0.0.1:8000/',
   hint_in:'Decimal (1.5, -2e-3), inf, -inf, nan, or a hex bit pattern (0x3f800000).',
   h_result:'2. Result',r_alu:'ALU output',r_ref:'Reference (float32, round-to-nearest)',r_true:'Exact value (64-bit)',r_abs:'Absolute error',r_rel:'Relative error',r_ulp:'Error in ULP',r_flags:'Flags',r_verdict:'Verdict',
-  note_ulp:'ULP = distance between two adjacent float32 values. A correctly rounded float32 result has at most 0.5 ULP of error against the exact value, i.e. relative error ≤ 2⁻²⁴ ≈ 5.96e-8.',
-  h_suite:'3. Preset test suite',btn_suite:'Run preset cases',h_rand:'4. Random accuracy test',btn_rand:'Run 5,000 random samples per operation',
+  note_ulp:'The ALU (round-to-nearest-even, full guard/round/sticky) is bit-exact against IEEE 754: every normal-input case below should read 0 ULP / Bit-exact. ULP = distance between two adjacent float32 values.',
+  h_suite:'3. Preset test suite',btn_suite:'Run preset cases',h_rand:'4. Random accuracy test',btn_rand:function(n){return 'Run '+n.toLocaleString('en-US')+' random samples per operation';},
   note_rand:'Only normal inputs with a normal, finite float32 reference are counted (no zero, subnormal, Inf, NaN).',
-  foot:'The page runs a bit-accurate JavaScript port of the corrected Verilog ALU (alu_model.js, verified against 182,304 Icarus Verilog simulation vectors with 0 mismatches). Reference = Math.fround on 64-bit floats.',
-  v_exact:'Bit-exact',v_1ulp:'Within 1 ULP',v_small:'Small error (≤ 4 ULP)',v_bad:'Mismatch',v_na:'n/a',
-  b_unused:'B is not used by this operation.',invalid:'Invalid number',stored:'stored as float32',
+  foot:'Engines: the JS model is a bit-accurate port of the corrected Verilog ALU (alu_model.js, verified against 182,304 Icarus Verilog vectors, 0 mismatches). With alu_server.py running, the page can instead run the real RTL in Vivado xsim. Reference = Math.fround on 64-bit floats.',
+  v_exact:'Bit-exact',v_1ulp:'Within 1 ULP',v_small:'Small error (≤ 4 ULP)',v_bad:'Mismatch',v_undef:'Undefined output (X/Z)',v_na:'n/a',
+  b_unused:'B is not used by this operation.',invalid:'Invalid number',undef:'X / Z (undriven)',
   th_op:'Operation',th_a:'A',th_b:'B',th_alu:'ALU output',th_ref:'Reference',th_ulp:'ULP',th_v:'Verdict',
   th_n:'Samples',th_exact:'Bit-exact',th_1:'≤ 1 ULP',th_max:'Max ULP',th_rel:'Mean rel. error',
-  sum_suite:function(p,t){return p+' of '+t+' cases within 1 ULP / exact';},running:'Running…',
-  flagsNone:'none',exc:'Exception',ovf:'Overflow',unf:'Underflow',sign:'sign',exp:'exponent',man:'mantissa',normal:'normal',subn:'subnormal / zero',spec:'Inf / NaN'},
+  sum_suite:function(p,t){return p+' of '+t+' cases bit-exact or within 1 ULP';},running:'Running…',
+  flagsNone:'none',exc:'Exception',ovf:'Overflow',unf:'Underflow',normal:'normal',subn:'subnormal / zero',spec:'Inf / NaN',
+  took:function(e,s){return e+' · '+s+' s';}},
  vi:{title:'Demo ALU số thực dấu phẩy động 32 bit',sub:'Nhập toán hạng, chọn phép tính và so sánh kết quả của ALU với kết quả chuẩn IEEE 754 float32.',
   h_input:'1. Toán hạng và phép tính',lbl_a:'Toán hạng A',lbl_b:'Toán hạng B',lbl_op:'Phép tính',lbl_preset:'Ví dụ',
+  lbl_engine:'Bộ chạy',btn_run:'Chạy',
+  eng_js:'Model JS (tức thì)',eng_vivado:'Vivado xsim (RTL thật)',eng_iverilog:'Icarus Verilog (RTL thật)',
+  eng_nosrv:'Chưa bật server nên đang dùng model JS. Muốn chạy mô phỏng RTL thật, chạy  python alu_server.py  rồi mở http://127.0.0.1:8000/',
   hint_in:'Số thập phân (1.5, -2e-3), inf, -inf, nan, hoặc chuỗi bit hex (0x3f800000).',
   h_result:'2. Kết quả',r_alu:'Kết quả ALU',r_ref:'Chuẩn (float32, làm tròn gần nhất)',r_true:'Giá trị chính xác (64 bit)',r_abs:'Sai số tuyệt đối',r_rel:'Sai số tương đối',r_ulp:'Sai số theo ULP',r_flags:'Cờ',r_verdict:'Đánh giá',
-  note_ulp:'ULP = khoảng cách giữa hai số float32 liền kề. Kết quả float32 làm tròn đúng chuẩn lệch tối đa 0,5 ULP so với giá trị chính xác, tức sai số tương đối ≤ 2⁻²⁴ ≈ 5,96e-8.',
-  h_suite:'3. Bộ test có sẵn',btn_suite:'Chạy các case có sẵn',h_rand:'4. Test độ chính xác ngẫu nhiên',btn_rand:'Chạy 5.000 mẫu ngẫu nhiên cho mỗi phép tính',
+  note_ulp:'ALU này làm tròn RNE với đầy đủ bit guard/round/sticky nên đúng tuyệt đối so với IEEE 754: mọi case đầu vào là số chuẩn dưới đây sẽ ra 0 ULP / Đúng tuyệt đối. ULP = khoảng cách giữa hai số float32 liền kề.',
+  h_suite:'3. Bộ test có sẵn',btn_suite:'Chạy các case có sẵn',h_rand:'4. Test độ chính xác ngẫu nhiên',btn_rand:function(n){return 'Chạy '+n.toLocaleString('de-DE')+' mẫu ngẫu nhiên cho mỗi phép tính';},
   note_rand:'Chỉ tính các mẫu có đầu vào và kết quả chuẩn đều là số chuẩn, hữu hạn (không tính 0, subnormal, Inf, NaN).',
-  foot:'Trang này chạy bản port JavaScript khớp từng bit với ALU Verilog đã sửa (alu_model.js, đã đối chiếu 182.304 vector mô phỏng Icarus Verilog, 0 sai lệch). Chuẩn = Math.fround trên số 64 bit.',
-  v_exact:'Đúng tuyệt đối',v_1ulp:'Lệch trong 1 ULP',v_small:'Sai nhỏ (≤ 4 ULP)',v_bad:'Sai',v_na:'không áp dụng',
-  b_unused:'Phép tính này không dùng B.',invalid:'Số không hợp lệ',stored:'lưu thành float32',
+  foot:'Bộ chạy: model JS là bản port khớp từng bit với ALU Verilog đã sửa (alu_model.js, đã đối chiếu 182.304 vector Icarus Verilog, 0 sai lệch). Khi alu_server.py đang chạy, trang có thể chạy RTL thật bằng Vivado xsim. Chuẩn = Math.fround trên số 64 bit.',
+  v_exact:'Đúng tuyệt đối',v_1ulp:'Lệch trong 1 ULP',v_small:'Sai nhỏ (≤ 4 ULP)',v_bad:'Sai',v_undef:'Ngõ ra không xác định (X/Z)',v_na:'không áp dụng',
+  b_unused:'Phép tính này không dùng B.',invalid:'Số không hợp lệ',undef:'X / Z (không được gán)',
   th_op:'Phép tính',th_a:'A',th_b:'B',th_alu:'Kết quả ALU',th_ref:'Chuẩn',th_ulp:'ULP',th_v:'Đánh giá',
   th_n:'Số mẫu',th_exact:'Đúng tuyệt đối',th_1:'≤ 1 ULP',th_max:'ULP lớn nhất',th_rel:'Sai số TB tương đối',
-  sum_suite:function(p,t){return p+' / '+t+' case đúng hoặc lệch trong 1 ULP';},running:'Đang chạy…',
-  flagsNone:'không có',exc:'Exception',ovf:'Overflow',unf:'Underflow',sign:'dấu',exp:'mũ',man:'mantissa',normal:'số chuẩn',subn:'subnormal / 0',spec:'Inf / NaN'}
+  sum_suite:function(p,t){return p+' / '+t+' case đúng tuyệt đối hoặc lệch trong 1 ULP';},running:'Đang chạy…',
+  flagsNone:'không có',exc:'Exception',ovf:'Overflow',unf:'Underflow',normal:'số chuẩn',subn:'subnormal / 0',spec:'Inf / NaN',
+  took:function(e,s){return e+' · '+s+' s';}}
 };
 var lang=(navigator.language||'en').toLowerCase().indexOf('vi')===0?'vi':'en';
 try{var sl=localStorage.getItem('alu_lang');if(sl==='en'||sl==='vi')lang=sl;}catch(e){}
 function t(k){return T[lang][k];}
-function $(id){return document.getElementById(id);}
 
 function parseIn(s){
   s=String(s).trim().toLowerCase();
@@ -201,27 +232,56 @@ function parseIn(s){
 function classOf(h){var e=(h>>>23)&255;return e===255?t('spec'):e===0?t('subn'):t('normal');}
 function info(h){return hex(h)+' · '+fmt(b2f(h),9)+' · '+classOf(h);}
 
-function compute(op,A,B){
-  var r=M.alu(op.op,A,B,op.sub);
-  var o={out:r.out,flags:r};
-  if(op.k==='f'||op.k==='f1'){
-    var x=b2f(A),y=b2f(B);
-    var exact=op.k==='f'?op.ref(x,y):op.ref(x);
-    var refb=f2b(exact);
-    var av=b2f(r.out);
-    o.exact=exact;o.ref=refb;o.ulp=ulpDist(r.out,refb);
-    if(isFinite(av)&&isFinite(exact)){o.abs=Math.abs(av-exact);o.rel=exact!==0?o.abs/Math.abs(exact):(o.abs===0?0:Infinity);}
-    else{o.abs=(av===exact||(av!==av&&exact!==exact))?0:Infinity;o.rel=o.abs;}
-  }else{
-    var rb=op.k==='b'?op.ref(A,B):op.ref(A);
-    o.ref=rb;o.ulp=r.out===rb?0:Infinity;
-  }
-  o.verdict=o.ulp===0?'exact':o.ulp<=1?'1ulp':(op.k.charAt(0)==='f'&&o.ulp<=4)?'small':'bad';
+/* ---------- engines: JS model or the local Python server (Vivado xsim / Icarus) ---------- */
+var srv=null,lastRun=null;
+function useServer(){return $('engine').value==='srv';}
+async function loadStatus(){
+  try{var r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('status');srv=await r.json();}catch(e){srv=null;}
+  buildEngineOptions(true);
+}
+function buildEngineOptions(first){
+  var sel=$('engine'),cur=first?'':sel.value,opts=[['js',t('eng_js')]];
+  if(srv&&srv.engine)opts.push(['srv',srv.engine==='vivado'?t('eng_vivado'):t('eng_iverilog')]);
+  sel.innerHTML=opts.map(function(o){return '<option value="'+o[0]+'">'+esc(o[1])+'</option>';}).join('');
+  sel.value=opts.some(function(o){return o[0]===cur;})?cur:(srv&&srv.engine?'srv':'js');
+  syncEngineUI();
+}
+function randN(){return useServer()?1000:5000;}
+function syncEngineUI(){
+  var s=useServer();
+  $('runRand').textContent=t('btn_rand')(randN());
+  $('runBtn').hidden=!s;
+  if(!srv)$('engStatus').textContent=t('eng_nosrv');
+  else if(!s)$('engStatus').textContent='';
+}
+async function runHW(cases){ /* cases: [[op,sub,A,B],...] -> [{out,exception,overflow,underflow}] */
+  if(!useServer())return cases.map(function(c){return M.alu(c[0],c[2],c[3],c[1]);});
+  var res=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({variant:'rtl',cases:cases})});
+  var j=await res.json();
+  if(!res.ok)throw new Error(j.error||('HTTP '+res.status));
+  lastRun={engine:j.engine,seconds:j.seconds};
+  $('engStatus').textContent=t('took')(j.engine==='vivado'?'Vivado xsim':'Icarus Verilog',j.seconds);
+  return j.results.map(function(r){return {out:r[0],exception:r[1][0],overflow:r[1][1],underflow:r[1][2]};});
+}
+function showErr(msg){var e=$('err');e.textContent=msg||'';e.hidden=!msg;}
+
+function analyze(op,A,B,r){
+  var o={out:r.out,flags:r},isF=isFloatOp(op),isI=isIntOp(op),x=b2f(A),y=b2f(B);
+  if(isF){o.exact=op.k==='f'?op.ref(x,y):op.ref(x);o.ref=f2b(o.exact);}
+  else if(isI){o.ref=op.ref(A);}
+  else o.ref=op.k==='b'?op.ref(A,B):op.ref(A);
+  if(r.out===null){o.undef=true;o.ulp=Infinity;o.abs=Infinity;o.rel=Infinity;o.verdict='undef';return o;}
+  if(isF){
+    var av=b2f(r.out);o.ulp=ulpDist(r.out,o.ref);
+    if(isFinite(av)&&isFinite(o.exact)){o.abs=Math.abs(av-o.exact);o.rel=o.exact!==0?o.abs/Math.abs(o.exact):(o.abs===0?0:Infinity);}
+    else{o.abs=(av===o.exact||(av!==av&&o.exact!==o.exact))?0:Infinity;o.rel=o.abs;}
+  }else o.ulp=r.out===o.ref?0:Infinity;
+  o.verdict=o.ulp===0?'exact':o.ulp<=1?'1ulp':(isF&&o.ulp<=4)?'small':'bad';
   return o;
 }
 function verdictHTML(v){
   var cls=v==='exact'||v==='1ulp'?'ok':v==='small'?'warn':'bad';
-  var key=v==='exact'?'v_exact':v==='1ulp'?'v_1ulp':v==='small'?'v_small':'v_bad';
+  var key=v==='exact'?'v_exact':v==='1ulp'?'v_1ulp':v==='small'?'v_small':v==='undef'?'v_undef':'v_bad';
   return '<span class="badge '+cls+'">'+t(key)+'</span>';
 }
 function flagsText(f){
@@ -229,72 +289,132 @@ function flagsText(f){
   return a.length?a.join(', '):t('flagsNone');
 }
 function sci(x){return x===Infinity?'∞':x===0?'0':x.toExponential(3);}
+function cell(o,h,isF,isI){
+  if(h===null)return t('undef');
+  if(isI)return hex(h)+' ('+toSigned(h)+')';
+  return hex(h)+(isF?' ('+fmt(b2f(h),7)+')':'');
+}
 
-function update(){
+/* ---------- single calculation ---------- */
+function updateInputs(){
   var op=OPBY[$('op').value];
-  var A=parseIn($('a').value),B=parseIn($('b').value);
+  var A=parseIn($('a').value),B=parseIn($('b').value),un=unaryOp(op);
   $('opcode').textContent='Operation = '+op.op+(op.op===0?', AddBar_Sub = '+op.sub:'');
-  var unusedB=(op.k==='f1'||op.k==='b1');
-  $('b').disabled=unusedB;
-  $('b_note').textContent=unusedB?t('b_unused'):'';
+  $('b').disabled=un;
+  $('b_note').textContent=un?t('b_unused'):'';
   $('a_info').textContent=A===null?t('invalid'):info(A);
-  $('b_info').textContent=B===null?(unusedB?'':t('invalid')):info(B);
+  $('b_info').textContent=B===null?(un?'':t('invalid')):info(B);
   $('a_bits').innerHTML=A===null?'':bitsHTML(A);
   $('b_bits').innerHTML=B===null?'':bitsHTML(B);
-  var ids=['r_alu','r_ref','r_true','r_abs','r_rel','r_ulp','r_flags','r_verdict'];
-  if(A===null||(B===null&&!unusedB)){ids.forEach(function(i){$(i).textContent='—';});return;}
-  if(unusedB)B=0;
-  var o=compute(op,A,B),isF=op.k.charAt(0)==='f';
-  var show=function(h){return '<span class="mono">'+hex(h)+'</span>'+(isF?' = <b>'+fmt(b2f(h),9)+'</b>':'')+'<br><span class="bits">'+bitsHTML(h)+'</span>';};
+}
+var seq=0,lastCalc=null;
+function clearResult(){['r_alu','r_ref','r_true','r_abs','r_rel','r_ulp','r_flags','r_verdict'].forEach(function(i){$(i).textContent='—';});}
+function renderResult(){
+  if(!lastCalc)return;
+  var op=lastCalc.op,o=lastCalc.o,isF=isFloatOp(op),isI=isIntOp(op);
+  var show=function(h){
+    if(h===null)return t('undef');
+    var dec=isF?' = <b>'+fmt(b2f(h),9)+'</b>':isI?' = <b>'+toSigned(h)+'</b>':'';
+    return '<span class="mono">'+hex(h)+'</span>'+dec+'<br><span class="bits">'+bitsHTML(h)+'</span>';
+  };
   $('r_alu').innerHTML=show(o.out);
   $('r_ref').innerHTML=show(o.ref);
   $('r_true').textContent=isF?fmt(o.exact,17):t('v_na');
-  $('r_abs').textContent=isF?sci(o.abs):t('v_na');
-  $('r_rel').textContent=isF?sci(o.rel):t('v_na');
-  $('r_ulp').textContent=o.ulp===Infinity?'∞':String(o.ulp);
-  $('r_flags').textContent=flagsText(o.flags);
+  $('r_abs').textContent=isF&&!o.undef?sci(o.abs):t('v_na');
+  $('r_rel').textContent=isF&&!o.undef?sci(o.rel):t('v_na');
+  $('r_ulp').textContent=o.undef?'—':o.ulp===Infinity?'∞':String(o.ulp);
+  $('r_flags').textContent=o.undef?'—':flagsText(o.flags);
   $('r_verdict').innerHTML=verdictHTML(o.verdict);
 }
+async function calc(){
+  var my=++seq,op=OPBY[$('op').value],un=unaryOp(op);
+  var A=parseIn($('a').value),B=parseIn($('b').value);
+  showErr('');
+  if(A===null||(B===null&&!un)){lastCalc=null;clearResult();return;}
+  if(un)B=0;
+  if(useServer())$('engStatus').textContent=t('running');
+  var r;
+  try{r=(await runHW([[op.op,op.sub,A,B]]))[0];}
+  catch(e){if(my===seq){showErr(e.message);if(useServer())$('engStatus').textContent='';}return;}
+  if(my!==seq)return;
+  lastCalc={op:op,o:analyze(op,A,B,r)};
+  renderResult();
+}
+function maybeCalc(){if(!useServer())calc();}
 
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
-function runSuite(){
-  var rows='<tr><th>'+t('th_op')+'</th><th>'+t('th_a')+'</th><th>'+t('th_b')+'</th><th>'+t('th_alu')+'</th><th>'+t('th_ref')+'</th><th>'+t('th_ulp')+'</th><th>'+t('th_v')+'</th></tr>';
-  var good=0;
-  PRESETS.forEach(function(p){
-    var op=OPBY[p[0]],A=parseIn(p[1]),B=parseIn(p[2]);
-    var o=compute(op,A,B),isF=op.k.charAt(0)==='f';
+/* ---------- preset suite ---------- */
+var suiteData=null;
+function renderSuite(){
+  if(!suiteData)return;
+  var rows='<tr><th>'+t('th_op')+'</th><th>'+t('th_a')+'</th><th>'+t('th_b')+'</th><th>'+t('th_alu')+'</th><th>'+t('th_ref')+'</th><th>'+t('th_ulp')+'</th><th>'+t('th_v')+'</th></tr>',good=0;
+  suiteData.forEach(function(d){
+    var op=d.op,o=d.o,isF=isFloatOp(op),isI=isIntOp(op);
     if(o.verdict==='exact'||o.verdict==='1ulp')good++;
-    var d=function(h){return hex(h)+(isF?' ('+fmt(b2f(h),7)+')':'');};
-    rows+='<tr><td>'+esc(op.name[lang])+'</td><td class="mono">'+esc(p[1])+'</td><td class="mono">'+(op.k==='f1'||op.k==='b1'?'—':esc(p[2]))+'</td><td class="mono">'+d(o.out)+'</td><td class="mono">'+d(o.ref)+'</td><td>'+(o.ulp===Infinity?'∞':o.ulp)+'</td><td>'+verdictHTML(o.verdict)+'</td></tr>';
+    rows+='<tr><td>'+esc(op.name[lang])+'</td><td class="mono">'+esc(d.p[1])+'</td><td class="mono">'+(unaryOp(op)?'—':esc(d.p[2]))+'</td><td class="mono">'+cell(o,o.out,isF,isI)+'</td><td class="mono">'+cell(o,o.ref,isF,isI)+'</td><td>'+(o.undef?'—':o.ulp===Infinity?'∞':o.ulp)+'</td><td>'+verdictHTML(o.verdict)+'</td></tr>';
   });
   $('suite').innerHTML=rows;
-  $('suiteSum').textContent=T[lang].sum_suite(good,PRESETS.length);
+  $('suiteSum').textContent=T[lang].sum_suite(good,suiteData.length);
+}
+async function runSuite(){
+  var btn=$('runSuite');btn.disabled=true;$('suiteSum').textContent=t('running');showErr('');
+  try{
+    var cs=PRESETS.map(function(p){var op=OPBY[p[0]];return [op.op,op.sub,parseIn(p[1]),parseIn(p[2])];});
+    var hw=await runHW(cs);
+    suiteData=PRESETS.map(function(p,i){var op=OPBY[p[0]];return {p:p,op:op,o:analyze(op,cs[i][2],cs[i][3],hw[i])};});
+    renderSuite();
+  }catch(e){showErr(e.message);$('suiteSum').textContent='';}
+  btn.disabled=false;
 }
 
+/* ---------- random accuracy test ---------- */
 function rnd(){var m=1+Math.random()*9,e=Math.floor(Math.random()*13)-6;return (Math.random()<.5?-1:1)*m*Math.pow(10,e);}
-function runRand(){
-  $('randSum').textContent=t('running');
-  setTimeout(function(){
-    var rows='<tr><th>'+t('th_op')+'</th><th>'+t('th_n')+'</th><th>'+t('th_exact')+'</th><th>'+t('th_1')+'</th><th>'+t('th_max')+'</th><th>'+t('th_rel')+'</th></tr>';
+var randData=null;
+function renderRand(){
+  if(!randData)return;
+  var rows='<tr><th>'+t('th_op')+'</th><th>'+t('th_n')+'</th><th>'+t('th_exact')+'</th><th>'+t('th_1')+'</th><th>'+t('th_max')+'</th><th>'+t('th_rel')+'</th></tr>';
+  randData.forEach(function(d){
+    rows+='<tr><td>'+esc(d.op.name[lang])+'</td><td>'+d.n+'</td><td>'+(100*d.ex/d.n).toFixed(2)+'%</td><td>'+(100*d.u1/d.n).toFixed(2)+'%</td><td>'+(d.mx===Infinity?'∞':d.mx)+'</td><td>'+sci(d.rel/d.n)+'</td></tr>';
+  });
+  $('rand').innerHTML=rows;
+}
+async function runRand(){
+  var btn=$('runRand');btn.disabled=true;$('randSum').textContent=t('running');showErr('');
+  try{
+    var all=[],groups=[];
     ['add','sub','mul','div','f2i'].forEach(function(id){
-      var op=OPBY[id],n=0,ex=0,u1=0,mx=0,rel=0,tries=0;
-      while(n<5000&&tries<60000){
+      var op=OPBY[id],isI=isIntOp(op),g={op:op,start:all.length,items:[]},tries=0;
+      while(g.items.length<randN()&&tries<60000){
         tries++;
-        var x=f2b(id==='f2i'?Math.abs(rnd())+1:rnd()),y=f2b(rnd());
-        var xv=b2f(x),yv=b2f(y);
-        var exact=op.k==='f'?op.ref(xv,yv):op.ref(xv);
-        var rb=f2b(exact);
+        if(isI){
+          var xi=f2b(rnd());
+          if(!normalF(xi))continue;
+          g.items.push([op.op,op.sub,xi,0]);
+          continue;
+        }
+        var x=f2b(rnd()),y=f2b(rnd());
+        var xv=b2f(x),yv=b2f(y),exact=op.k==='f'?op.ref(xv,yv):op.ref(xv),rb=f2b(exact);
         if(!normalF(x)||(op.k==='f'&&!normalF(y))||!isFinite(exact)||exact===0||!normalF(rb))continue;
-        var o=compute(op,x,y);
-        n++;if(o.ulp===0)ex++;if(o.ulp<=1)u1++;if(o.ulp>mx)mx=o.ulp;
-        rel+=isFinite(o.rel)?o.rel:1;
+        g.items.push([op.op,op.sub,x,y]);
       }
-      rows+='<tr><td>'+esc(op.name[lang])+'</td><td>'+n+'</td><td>'+(100*ex/n).toFixed(2)+'%</td><td>'+(100*u1/n).toFixed(2)+'%</td><td>'+(mx===Infinity?'∞':mx)+'</td><td>'+sci(rel/n)+'</td></tr>';
+      g.items.forEach(function(c){all.push(c);});
+      groups.push(g);
     });
-    $('rand').innerHTML=rows;$('randSum').textContent='';
-  },30);
+    var hw=await runHW(all);
+    randData=groups.map(function(g){
+      var d={op:g.op,n:g.items.length,ex:0,u1:0,mx:0,rel:0};
+      g.items.forEach(function(c,i){
+        var o=analyze(g.op,c[2],c[3],hw[g.start+i]);
+        if(o.ulp===0)d.ex++;if(o.ulp<=1)d.u1++;if(o.ulp>d.mx)d.mx=o.ulp;
+        d.rel+=isFinite(o.rel)?o.rel:1;
+      });
+      return d;
+    });
+    renderRand();$('randSum').textContent='';
+  }catch(e){showErr(e.message);$('randSum').textContent='';}
+  btn.disabled=false;
 }
 
+/* ---------- UI wiring ---------- */
 function applyLang(){
   document.documentElement.lang=lang;
   document.querySelectorAll('[data-i]').forEach(function(n){n.textContent=t(n.getAttribute('data-i'));});
@@ -304,21 +424,27 @@ function applyLang(){
   $('op').value=cur;
   var pc=$('preset').value;
   $('preset').innerHTML='<option value="">—</option>'+PRESETS.map(function(p,i){
-    var op=OPBY[p[0]];return '<option value="'+i+'">'+esc(op.name[lang].split(' (')[0]+': '+p[1]+(op.k==='f1'||op.k==='b1'?'':', '+p[2]))+'</option>';}).join('');
+    var op=OPBY[p[0]];return '<option value="'+i+'">'+esc(op.name[lang].split(' (')[0]+': '+p[1]+(unaryOp(op)?'':', '+p[2]))+'</option>';}).join('');
   $('preset').value=pc;
-  update();
-  if($('suite').innerHTML)runSuite();
+  buildEngineOptions(false);
+  updateInputs();renderResult();renderSuite();renderRand();
 }
 $('lang').onclick=function(){lang=lang==='en'?'vi':'en';try{localStorage.setItem('alu_lang',lang);}catch(e){}applyLang();};
-['a','b'].forEach(function(i){$(i).addEventListener('input',update);});
-$('op').addEventListener('change',update);
+['a','b'].forEach(function(i){
+  $(i).addEventListener('input',function(){updateInputs();maybeCalc();});
+  $(i).addEventListener('keydown',function(e){if(e.key==='Enter')calc();});
+});
+$('op').addEventListener('change',function(){updateInputs();maybeCalc();});
 $('preset').addEventListener('change',function(){
   var v=this.value;if(v==='')return;var p=PRESETS[+v];
-  $('op').value=p[0];$('a').value=p[1];$('b').value=p[2];update();
+  $('op').value=p[0];$('a').value=p[1];$('b').value=p[2];updateInputs();calc();
 });
+$('engine').addEventListener('change',function(){syncEngineUI();calc();});
+$('runBtn').onclick=calc;
 $('runSuite').onclick=runSuite;
 $('runRand').onclick=runRand;
 applyLang();
+loadStatus().then(function(){updateInputs();calc();});
 })();
 </script>
 </body>

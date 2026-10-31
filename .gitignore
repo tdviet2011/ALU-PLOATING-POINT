@@ -4,3 +4,6 @@ Floating_Point_ALU/Floating_Point_ALU.ip_user_files/
 Floating_Point_ALU/Floating_Point_ALU.sim/
 *.jou
 *.log
+sim_build/
+__pycache__/
+xsim.dir/

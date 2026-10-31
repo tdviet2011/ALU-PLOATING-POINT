@@ -1,151 +1,106 @@
 `timescale 1ns / 1ps
+//==============================================================================
+// priority_encoder.v  -  shared helper blocks for the floating point datapath
+//
+//  1. priority_encoder #(W)  : leading-zero counter + normalising left shifter
+//  2. fp_round_pack  #(W)    : IEEE 754 round-to-nearest-even + pack into float32
+//
+// Both are used by Addition_Subtraction, Multiplication and Division, so all
+// three operations share one rounding / overflow / underflow implementation.
+//
+// Changes against the original file
+//  - The original was a 25-way casex ladder. Its "default" branch (a negative
+//    difference) and the all-zero branch (shift = 24) produced wrong results
+//    for x - x and for exponent differences >= 24. It is replaced by a generic
+//    loop that synthesises to a priority chain of W inputs.
+//  - Rounding (guard / sticky bits, ties-to-even) and overflow / underflow
+//    detection used to be missing; they now live in fp_round_pack.
+//==============================================================================
 
-module priority_encoder(
-			input [24:0] significand,
-			input [7:0] Exponent_a,
-			output reg [24:0] Significand,
-			output [7:0] Exponent_sub
-			);
+//------------------------------------------------------------------------------
+// Leading-zero counter and normaliser.
+//   out = in << lz, so out[W-1] = 1 whenever in != 0.
+//   lz  = number of leading zeros (= W when in == 0).
+//------------------------------------------------------------------------------
+module priority_encoder #(parameter W = 28)(
+    input      [W-1:0] in,
+    output reg [W-1:0] out,
+    output reg [6:0]   lz
+);
+    integer i;
+    reg     found;
 
-reg [4:0] shift;
+    always @(*) begin
+        lz    = W;
+        found = 1'b0;
+        // scan from the MSB: the first '1' fixes the shift amount
+        for (i = W - 1; i >= 0; i = i - 1)
+            if (!found && in[i]) begin
+                lz    = W - 1 - i;
+                found = 1'b1;
+            end
+        out = (lz >= W) ? {W{1'b0}} : (in << lz);
+    end
+endmodule
 
-always @(significand)
-begin
-	casex (significand)
-				25'b0 :
-		begin
-			 Significand = 25'd0;
-			 shift = 5'd24;
-		end
-		25'b1_1xxx_xxxx_xxxx_xxxx_xxxx_xxxx :	begin
-													Significand = significand;
-									 				shift = 5'd0;
-								 			  	end
-		25'b1_01xx_xxxx_xxxx_xxxx_xxxx_xxxx : 	begin						
-										 			Significand = significand << 1;
-									 				shift = 5'd1;
-								 			  	end
+//------------------------------------------------------------------------------
+// Round-to-nearest-even and packing.
+//   n[W-1:0] : normalised significand, n[W-1] = 1 (n != 0).
+//              n[W-1:W-24] = 24-bit significand (hidden bit first),
+//              n[W-25]     = guard bit,
+//              n[W-26:0]   = sticky bits (OR of everything below the guard).
+//   e        : biased exponent that n[W-1] would carry, i.e. the value is
+//              1.xxx * 2^(e-127). e can be <= 0 (result is subnormal) or
+//              > 254 (result overflows).
+// Subnormal results: n is shifted right by (1 - e) with the shifted-out bits
+// folded into the sticky term, then rounded like a normal number.
+// Packing trick: bits = ((e-1) << 23) + significand. A rounding carry out of
+// the significand increments the exponent automatically, and a subnormal that
+// rounds up to 2^23 becomes the smallest normal number.
+//------------------------------------------------------------------------------
+module fp_round_pack #(parameter W = 28)(
+    input                sign,
+    input  signed [11:0] e,
+    input      [W-1:0]   n,
+    output     [31:0]    result,
+    output               overflow,    // result became +/-Inf
+    output               underflow    // tiny (subnormal range) and inexact
+);
+    integer      sh;
+    reg [W-1:0]  m;
+    reg          lost, guard, sticky, inc;
+    reg [23:0]   sig;
+    reg [24:0]   sigr;
+    reg [31:0]   base, val;
+    reg          of_r, uf_r;
 
-		25'b1_001x_xxxx_xxxx_xxxx_xxxx_xxxx : 	begin						
-										 			Significand = significand << 2;
-									 				shift = 5'd2;
-								 				end
+    always @(*) begin
+        // right shift needed to reach the subnormal alignment
+        sh = (e >= 12'sd1) ? 0 : (1 - e);
+        if (sh == 0) begin
+            m    = n;
+            lost = 1'b0;
+        end else if (sh >= W) begin
+            m    = {W{1'b0}};
+            lost = (n != {W{1'b0}});
+        end else begin
+            m    = n >> sh;
+            lost = ((m << sh) != n);          // were any '1' bits shifted out?
+        end
 
-		25'b1_0001_xxxx_xxxx_xxxx_xxxx_xxxx : 	begin 							
-													Significand = significand << 3;
-								 	 				shift = 5'd3;
-								 				end
+        sig    = m[W-1:W-24];
+        guard  = m[W-25];
+        sticky = (|m[W-26:0]) | lost;
+        inc    = guard & (sticky | sig[0]);   // ties go to the even significand
+        sigr   = {1'b0, sig} + inc;
 
-		25'b1_0000_1xxx_xxxx_xxxx_xxxx_xxxx : 	begin						
-									 				Significand = significand << 4;
-								 	 				shift = 5'd4;
-								 				end
+        base   = (e >= 12'sd1) ? (e - 12'sd1) : 32'd0;
+        val    = (base << 23) + sigr;
+        of_r   = (val >= 32'h7F800000);
+        uf_r   = (e < 12'sd1) & (guard | sticky);
+    end
 
-		25'b1_0000_01xx_xxxx_xxxx_xxxx_xxxx : 	begin						
-									 				Significand = significand << 5;
-								 	 				shift = 5'd5;
-								 				end
-
-		25'b1_0000_001x_xxxx_xxxx_xxxx_xxxx : 	begin						// 24'h020000
-									 				Significand = significand << 6;
-								 	 				shift = 5'd6;
-								 				end
-
-		25'b1_0000_0001_xxxx_xxxx_xxxx_xxxx : 	begin						// 24'h010000
-									 				Significand = significand << 7;
-								 	 				shift = 5'd7;
-								 				end
-
-		25'b1_0000_0000_1xxx_xxxx_xxxx_xxxx : 	begin						// 24'h008000
-									 				Significand = significand << 8;
-								 	 				shift = 5'd8;
-								 				end
-
-		25'b1_0000_0000_01xx_xxxx_xxxx_xxxx : 	begin						// 24'h004000
-									 				Significand = significand << 9;
-								 	 				shift = 5'd9;
-								 				end
-
-		25'b1_0000_0000_001x_xxxx_xxxx_xxxx : 	begin						// 24'h002000
-									 				Significand = significand << 10;
-								 	 				shift = 5'd10;
-								 				end
-
-		25'b1_0000_0000_0001_xxxx_xxxx_xxxx : 	begin						// 24'h001000
-									 				Significand = significand << 11;
-								 	 				shift = 5'd11;
-								 				end
-
-		25'b1_0000_0000_0000_1xxx_xxxx_xxxx : 	begin						// 24'h000800
-									 				Significand = significand << 12;
-								 	 				shift = 5'd12;
-								 				end
-
-		25'b1_0000_0000_0000_01xx_xxxx_xxxx : 	begin						// 24'h000400
-									 				Significand = significand << 13;
-								 	 				shift = 5'd13;
-								 				end
-
-		25'b1_0000_0000_0000_001x_xxxx_xxxx : 	begin						// 24'h000200
-									 				Significand = significand << 14;
-								 	 				shift = 5'd14;
-								 				end
-
-		25'b1_0000_0000_0000_0001_xxxx_xxxx  : 	begin						// 24'h000100
-									 				Significand = significand << 15;
-								 	 				shift = 5'd15;
-								 				end
-
-		25'b1_0000_0000_0000_0000_1xxx_xxxx : 	begin						// 24'h000080
-									 				Significand = significand << 16;
-								 	 				shift = 5'd16;
-								 				end
-
-		25'b1_0000_0000_0000_0000_01xx_xxxx : 	begin						// 24'h000040
-											 		Significand = significand << 17;
-										 	 		shift = 5'd17;
-												end
-
-		25'b1_0000_0000_0000_0000_001x_xxxx : 	begin						// 24'h000020
-									 				Significand = significand << 18;
-								 	 				shift = 5'd18;
-								 				end
-
-		25'b1_0000_0000_0000_0000_0001_xxxx : 	begin						// 24'h000010
-									 				Significand = significand << 19;
-								 	 				shift = 5'd19;
-												end
-
-		25'b1_0000_0000_0000_0000_0000_1xxx :	begin						// 24'h000008
-									 				Significand = significand << 20;
-								 					shift = 5'd20;
-								 				end
-
-		25'b1_0000_0000_0000_0000_0000_01xx : 	begin						// 24'h000004
-									 				Significand = significand << 21;
-								 	 				shift = 5'd21;
-								 				end
-
-		25'b1_0000_0000_0000_0000_0000_001x : 	begin						// 24'h000002
-									 				Significand = significand << 22;
-								 	 				shift = 5'd22;
-								 				end
-
-		25'b1_0000_0000_0000_0000_0000_0001 : 	begin						// 24'h000001
-									 				Significand = significand << 23;
-								 	 				shift = 5'd23;
-								 				end
-
-		25'b1_0000_0000_0000_0000_0000_0000 : 	begin						// 24'h000000
-								 					Significand = significand << 24;
-							 	 					shift = 5'd24;
-								 				end
-		default : 	begin
-						Significand = (~significand) + 1'b1;
-						shift = 8'd0;
-					end
-	endcase
-end
-assign Exponent_sub = Exponent_a - shift;
-
+    assign result    = of_r ? {sign, 8'hFF, 23'h0} : {sign, val[30:0]};
+    assign overflow  = of_r;
+    assign underflow = uf_r;
 endmodule

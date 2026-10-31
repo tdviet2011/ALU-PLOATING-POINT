@@ -1,96 +1,111 @@
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//File Name: Additon_Subtraction.v
-//Created By: Sheetal Swaroop Burada
-//Date: 30-04-2019
-//Project Name: Design of 32 Bit Floating Point ALU Based on Standard IEEE-754 in Verilog and its implementation on FPGA.
-//University: Dayalbagh Educational Institute
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
+`timescale 1ns / 1ps
+//==============================================================================
+// ADD_SUB.v  -  IEEE 754 single precision adder / subtractor
+// Original author: Sheetal Swaroop Burada (2019), Dayalbagh Educational Institute.
+// Rewritten: correct rounding, subnormals, Inf/NaN, overflow/underflow flags.
+//
+// Algorithm (purely combinational)
+//   1. Operand b gets the effective sign  sb = sign(b) XOR AddBar_Sub, so a - b
+//      is handled as a + (-b).
+//   2. Order the operands by magnitude (x >= y) so the subtraction never goes
+//      negative and the result sign is the sign of x.
+//   3. Alignment: shift y right by d = ex - ey. The shifted-out bits are
+//      collapsed into one sticky bit, giving 3 extra bits (guard, round, sticky).
+//      (Subnormals use exponent 1 and hidden bit 0.)
+//   4. Add or subtract the 27-bit extended significands (28-bit result).
+//   5. Normalise with a leading-zero count (priority_encoder), then round to
+//      nearest-even and pack (fp_round_pack).
+//
+// Fixes against the original
+//   - Two's complement of the shifted significand was only 24 bits wide, so for
+//     an exponent difference >= 24 the carry was lost and the result was wrong
+//     (3e38 - 1.0 gave 1.7e38).
+//   - x - x returned 2^-24 instead of +0.
+//   - No guard/round/sticky bits: results were truncated (up to 1 ULP off);
+//     now round-to-nearest-even, bit-exact against IEEE 754.
+//   - Inf/NaN operands returned 0; now NaN -> qNaN, Inf +- Inf handled.
+//   - Overflow (result > 3.4e38) is detected and returns +/-Inf; Underflow flag
+//     added.
+//   - Removed the always-true 'perform' signal and the extra exponent adder.
+//
+// Ports: the first five keep the original order (a, b, AddBar_Sub, Exception,
+// result); Overflow/Underflow are new and come last.
+//==============================================================================
 module Addition_Subtraction(
-input [31:0] a_operand,b_operand, //Inputs in the format of IEEE-754 Representation.
-input AddBar_Sub,				  //If Add_Sub is low then Addition else Subtraction.
-output Exception,
-output [31:0] result              //Outputs in the format of IEEE-754 Representation.
+    input  [31:0] a_operand,
+    input  [31:0] b_operand,
+    input         AddBar_Sub,      // 0: a + b, 1: a - b
+    output        Exception,       // an operand is Inf or NaN (exponent = 255)
+    output [31:0] result,
+    output        Overflow,        // finite operands, result rounds to Inf
+    output        Underflow        // result is subnormal and inexact
 );
+    //-------------------------------------------------------------- classify
+    wire       sa = a_operand[31];
+    wire       sb = b_operand[31] ^ AddBar_Sub;      // effective sign of b
+    wire [7:0] ea = a_operand[30:23];
+    wire [7:0] eb = b_operand[30:23];
 
-wire operation_sub_addBar;
-wire Comp_enable;
-wire output_sign;
+    wire a_nan = (ea == 8'hFF) && (a_operand[22:0] != 23'd0);
+    wire b_nan = (eb == 8'hFF) && (b_operand[22:0] != 23'd0);
+    wire a_inf = (ea == 8'hFF) && (a_operand[22:0] == 23'd0);
+    wire b_inf = (eb == 8'hFF) && (b_operand[22:0] == 23'd0);
 
-wire [31:0] operand_a,operand_b;
-wire [23:0] significand_a,significand_b;
-wire [7:0] exponent_diff;
+    assign Exception = (ea == 8'hFF) | (eb == 8'hFF);
 
-wire perform;         
+    //------------------------------------------- order by magnitude (x >= y)
+    wire        swap = (a_operand[30:0] < b_operand[30:0]);
+    wire [31:0] x    = swap ? b_operand : a_operand;
+    wire [31:0] y    = swap ? a_operand : b_operand;
+    wire        sx   = swap ? sb : sa;               // result sign
+    wire        sy   = swap ? sa : sb;
+    wire        eff_sub = sx ^ sy;                   // magnitudes subtract
 
-wire [23:0] significand_b_add_sub;
-wire [7:0] exponent_b_add_sub;
+    // effective exponent: subnormals (exp = 0) behave as exponent 1, hidden bit 0
+    wire [7:0]  ex = (x[30:23] == 8'd0) ? 8'd1 : x[30:23];
+    wire [7:0]  ey = (y[30:23] == 8'd0) ? 8'd1 : y[30:23];
+    wire [23:0] mx = {(x[30:23] != 8'd0), x[22:0]};
+    wire [23:0] my = {(y[30:23] != 8'd0), y[22:0]};
 
-wire [24:0] significand_add;
-wire [30:0] add_sum;
+    //------------------------------------------------------------- alignment
+    wire [7:0]  d    = ex - ey;
+    wire [63:0] wide = {my, 3'b000, 37'd0};
+    wire [63:0] shy  = (d >= 8'd64) ? 64'd0 : (wide >> d);
+    wire        lost = (d >= 8'd64) ? (wide != 64'd0) : ((shy << d) != wide);
+    // 24 significand bits + guard + round + sticky (all lower bits OR-ed in)
+    wire [26:0] yext = {shy[63:38], shy[37] | (|shy[36:0]) | lost};
+    wire [26:0] xext = {mx, 3'b000};
 
-wire [23:0] significand_sub_complement;
-wire [24:0] significand_sub;
-wire [30:0] sub_diff;
-wire [24:0] subtraction_diff; 
-wire [7:0] exponent_sub;
+    //---------------------------------------------------------- add / subtract
+    wire [27:0] r = eff_sub ? ({1'b0, xext} - {1'b0, yext})
+                            : ({1'b0, xext} + {1'b0, yext});
+    wire        r_zero = (r == 28'd0);
 
-//for operations always operand_a must not be less than b_operand
-assign {Comp_enable,operand_a,operand_b} = (a_operand[30:0] < b_operand[30:0]) ? {1'b1,b_operand,a_operand} : {1'b0,a_operand,b_operand};
-//Exception flag sets 1 if either one of the exponent is 255.
-assign Exception = (&operand_a[30:23]) | (&operand_b[30:23]);
+    //------------------------------------------ normalise, round and pack
+    wire [27:0] rn;
+    wire [6:0]  lz;
+    priority_encoder #(28) pe (.in(r), .out(rn), .lz(lz));
 
-assign output_sign = AddBar_Sub ? Comp_enable ? !operand_a[31] : operand_a[31] : operand_a[31] ;
+    // r[26] carries the weight of exponent ex; r[27] is the carry-out
+    wire signed [11:0] e = $signed({4'b0000, ex}) + 12'sd1 - $signed({5'b00000, lz});
 
-assign operation_sub_addBar = AddBar_Sub ? operand_a[31] ^ operand_b[31] : ~(operand_a[31] ^ operand_b[31]);
+    wire [31:0] packed_res;
+    wire        pk_of, pk_uf;
+    fp_round_pack #(28) rp (.sign(sx), .e(e), .n(rn),
+                            .result(packed_res), .overflow(pk_of), .underflow(pk_uf));
 
-//Assigining significand values according to Hidden Bit.
-//If exponent is equal to zero then hidden bit will be 0 for that respective significand else it will be 1
-assign significand_a = (|operand_a[30:23]) ? {1'b1,operand_a[22:0]} : {1'b0,operand_a[22:0]};
-assign significand_b = (|operand_b[30:23]) ? {1'b1,operand_b[22:0]} : {1'b0,operand_b[22:0]};
+    //------------------------------------------------------------ result mux
+    // exact zero: +0, except (-0) + (-0) = -0
+    wire zero_sign = eff_sub ? 1'b0 : sx;
+    wire invalid   = a_nan | b_nan | (a_inf & b_inf & (sa != sb));   // Inf - Inf
+    wire special   = invalid | a_inf | b_inf;
 
-//Evaluating Exponent Difference
-assign exponent_diff = operand_a[30:23] - operand_b[30:23];
+    assign result = invalid ? 32'h7FC00000 :
+                    a_inf   ? {sa, 8'hFF, 23'd0} :
+                    b_inf   ? {sb, 8'hFF, 23'd0} :
+                    r_zero  ? {zero_sign, 31'd0} :
+                              packed_res;
 
-//Shifting significand_b according to exponent_diff
-assign significand_b_add_sub = significand_b >> exponent_diff;
-
-assign exponent_b_add_sub = operand_b[30:23] + exponent_diff; 
-
-//Checking exponents are same or not
-assign perform = (operand_a[30:23] == exponent_b_add_sub);
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////
-//------------------------------------------------ADD BLOCK------------------------------------------//
-
-assign significand_add = (perform & operation_sub_addBar) ? (significand_a + significand_b_add_sub) : 25'd0; 
-
-//Result will be equal to Most 23 bits if carry generates else it will be Least 22 bits.
-assign add_sum[22:0] = significand_add[24] ? significand_add[23:1] : significand_add[22:0];
-
-//If carry generates in sum value then exponent must be added with 1 else feed as it is.
-assign add_sum[30:23] = significand_add[24] ? (1'b1 + operand_a[30:23]) : operand_a[30:23];
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////
-//------------------------------------------------SUB BLOCK------------------------------------------//
-
-assign significand_sub_complement  = (perform & !operation_sub_addBar) ? ~(significand_b_add_sub) + 24'd1 : 24'd0 ; 
-
-assign significand_sub = perform ? (significand_a + significand_sub_complement) : 25'd0;
-
-priority_encoder pe(significand_sub,operand_a[30:23],subtraction_diff,exponent_sub);
-
-assign sub_diff[30:23] = exponent_sub;
-
-assign sub_diff[22:0] = subtraction_diff[22:0];
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////
-//-------------------------------------------------OUTPUT--------------------------------------------//
-
-//If there is no exception and operation will evaluate
-
-
-assign result = Exception ? 32'b0 : ((!operation_sub_addBar) ? {output_sign,sub_diff} : {output_sign,add_sum});
-
+    assign Overflow  = ~special & ~r_zero & pk_of;
+    assign Underflow = ~special & ~r_zero & pk_uf;
 endmodule

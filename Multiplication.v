@@ -1,52 +1,81 @@
 `timescale 1ns / 1ps
+//==============================================================================
+// Multiplication.v  -  IEEE 754 single precision multiplier
+// Original author: Sheetal Swaroop Burada (2019), Dayalbagh Educational Institute.
+//
+// Algorithm (purely combinational)
+//   1. sign   = sign(a) XOR sign(b)
+//   2. 24 x 24 -> 48-bit significand product (hidden bit = 1, or 0 for subnormal
+//      inputs, which use exponent 1).
+//   3. Normalise the product with a leading-zero count, so subnormal inputs
+//      are handled too. The exponent of the normalised product is
+//         e = ea + eb - 126 - lz     (reduces to ea + eb - 127 (+1) for normals)
+//   4. Round to nearest-even and pack (fp_round_pack), which also produces
+//      gradual underflow (subnormal results) and overflow to Inf.
+//
+// Fixes against the original
+//   - The file did not compile: 'endmodule' and 'assign result' were missing and
+//     four signals were assigned twice.
+//   - The 'zero' flag was derived from the product mantissa, so every power of
+//     two (1.0 * 1.0, 2.0 * 0.5, ...) was reported as zero. It now tests the
+//     operands.
+//   - Rounding added 1 on guard & sticky only: no round-half-to-even and the
+//     carry out of the mantissa (0x7FFFFF + 1) never reached the exponent.
+//   - Inf/NaN operands returned 0; now NaN, Inf and Inf * 0 = NaN follow IEEE.
+//   - Subnormal inputs/results are supported (previously flushed or garbage).
+//
+// Port order is unchanged: a, b, Exception, Overflow, Underflow, result.
+//==============================================================================
 module Multiplication(
-		input [31:0] a_operand,
-		input [31:0] b_operand,
-		output Exception,Overflow,Underflow,
-		output [31:0] result
-		);
+    input  [31:0] a_operand,
+    input  [31:0] b_operand,
+    output        Exception,       // an operand is Inf or NaN (exponent = 255)
+    output        Overflow,        // finite operands, result rounds to Inf
+    output        Underflow,       // result is subnormal and inexact
+    output [31:0] result
+);
+    wire       sign = a_operand[31] ^ b_operand[31];
+    wire [7:0] ea   = a_operand[30:23];
+    wire [7:0] eb   = b_operand[30:23];
 
-wire sign,product_round,normalised,zero;
-wire [8:0] exponent,sum_exponent;
-wire [22:0] product_mantissa;
-wire [23:0] operand_a,operand_b;
-wire [47:0] product,product_normalised; 
+    wire a_nan  = (ea == 8'hFF) && (a_operand[22:0] != 23'd0);
+    wire b_nan  = (eb == 8'hFF) && (b_operand[22:0] != 23'd0);
+    wire a_inf  = (ea == 8'hFF) && (a_operand[22:0] == 23'd0);
+    wire b_inf  = (eb == 8'hFF) && (b_operand[22:0] == 23'd0);
+    wire a_zero = (a_operand[30:0] == 31'd0);
+    wire b_zero = (b_operand[30:0] == 31'd0);
 
-assign sign = a_operand[31] ^ b_operand[31];
+    assign Exception = (ea == 8'hFF) | (eb == 8'hFF);
 
-//Exception flag sets 1 if either one of the exponent is 255.
-assign Exception = (&a_operand[30:23]) | (&b_operand[30:23]);
+    // effective exponents and significands (subnormal: exponent 1, hidden bit 0)
+    wire [7:0]  ea_e = (ea == 8'd0) ? 8'd1 : ea;
+    wire [7:0]  eb_e = (eb == 8'd0) ? 8'd1 : eb;
+    wire [23:0] ma   = {(ea != 8'd0), a_operand[22:0]};
+    wire [23:0] mb   = {(eb != 8'd0), b_operand[22:0]};
 
-//Assigining significand values according to Hidden Bit.
-//If exponent is equal to zero then hidden bit will be 0 for that respective significand else it will be 1
+    wire [47:0] product = ma * mb;
 
-assign operand_a = (|a_operand[30:23]) ? {1'b1,a_operand[22:0]} : {1'b0,a_operand[22:0]};
-assign operand_b = (|b_operand[30:23]) ? {1'b1,b_operand[22:0]} : {1'b0,b_operand[22:0]};
-			//Calculating Product
-assign product = operand_a * operand_b;			
-assign product_round = |product_normalised[22:0];  //Ending 22 bits are OR'ed for rounding operation.
-assign normalised = product[47] ? 1'b1 : 1'b0;
-assign product_normalised = normalised ? product : product << 1;	//Assigning Normalised value based on 48th bit
+    // normalise so that the MSB of the 48-bit product is 1
+    wire [47:0] pn;
+    wire [6:0]  lz;
+    priority_encoder #(48) pe (.in(product), .out(pn), .lz(lz));
 
-//Final Manitssa.
-assign product_mantissa = product_normalised[46:24] + (product_normalised[23] & product_round); 
-assign zero = Exception ? 1'b0 : (product_mantissa == 23'd0) ? 1'b1 : 1'b0;
-assign sum_exponent = a_operand[30:23] + b_operand[30:23];
-assign exponent = sum_exponent - 8'd127 + normalised;
+    wire signed [11:0] e = $signed({4'b0000, ea_e}) + $signed({4'b0000, eb_e})
+                         - 12'sd126 - $signed({5'b00000, lz});
 
-assign Overflow = ((exponent[8] & !exponent[7]) & !zero) ; //If overall exponent is greater than 255 then Overflow condition.
-//Exception Case when exponent reaches its maximu value that is 384.
+    wire [31:0] packed_res;
+    wire        pk_of, pk_uf;
+    fp_round_pack #(48) rp (.sign(sign), .e(e), .n(pn),
+                            .result(packed_res), .overflow(pk_of), .underflow(pk_uf));
 
-//If sum of both exponents is less than 127 then Underflow condition.
- 
-assign sum_exponent = a_operand[30:23] + b_operand[30:23];
+    wire invalid = a_nan | b_nan | (a_inf & b_zero) | (b_inf & a_zero);   // Inf * 0
+    wire special = invalid | a_inf | b_inf | a_zero | b_zero;
 
-assign exponent = sum_exponent - 8'd127 + normalised;
+    assign result = invalid          ? 32'h7FC00000 :
+                    (a_inf | b_inf)  ? {sign, 8'hFF, 23'd0} :
+                    (a_zero | b_zero)? {sign, 31'd0} :
+                                       packed_res;
 
-assign Overflow = ((exponent[8] & !exponent[7]) & !zero) ; //If overall exponent is greater than 255 then Overflow condition.
-//Exception Case when exponent reaches its maximu value that is 384.
-
-//If sum of both exponents is less than 127 then Underflow condition.
-assign Underflow = ((exponent[8] & exponent[7]) & !zero) ? 1'b1 : 1'b0; 
-
+    assign Overflow  = ~special & pk_of;
+    assign Underflow = ~special & pk_uf;
 endmodule
