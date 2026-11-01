@@ -9,7 +9,6 @@ The datapath started from *Design of 32 Bit Floating Point ALU Based on Standard
 | Path | Description |
 | --- | --- |
 | `ALU.v`, `ADD_SUB.v`, `Multiplication.v`, `Division.v`, `priority_encoder.v`, `Floating_Point_to_Integer.v` | ALU RTL |
-| `Iteration.v` | Not used by the current RTL; kept only so old project file lists stay valid (see [Known issues](#7-known-issues-and-fixes)) |
 | `tb_ALU.v`, `gentb.py` | Self-checking testbench (8,734 cases, bit-exact) and the script that generates it |
 | `docs/index.html`, `docs/alu_model.js` | Web demo: enter operands, run an operation, compare with the exact float32 result |
 | `alu_server.py`, `tb_run.v`, `run_demo.bat` | Local server that runs the demo page's cases through the real RTL in **Vivado xsim** (Icarus Verilog fallback) |
@@ -219,7 +218,7 @@ The arithmetic units (`ADD_SUB.v`, `Multiplication.v`, `Division.v`, `Floating_P
 3. **`ADD_SUB.v`: narrow two's complement** — the original's complement of the shifted significand was only 24 bits, so an exponent difference ≥ 24 lost the carry (e.g. `3e38 − 1.0` returned `1.7e38`); it is now 25+ bits and exact.
 4. **`ADD_SUB.v`: `x − x` returned `2^-24`** instead of `+0`, because the all-zero case fell through the original's leading-zero table into its `default` branch.
 5. **`Multiplication.v`: wrong `zero` flag** — it was derived from the *rounded result's* mantissa, so every power of two (`1.0 × 1.0`, `2.0 × 0.5`, …) was reported as zero; the rewrite only checks the operands and is no longer needed, since `fp_round_pack` produces the correct zero/subnormal/normal result directly.
-6. **`Division.v`: wrong Newton-Raphson seed** (`−37/17` instead of `−32/17`) made ~46% of cases with a mantissa ≥ 1.875 wrong by hundreds of ULP, and even corrected the method still lost 2–4 ULP per division because every adder/multiplier inside the 3 iterations truncated. **Division.v now uses an exact restoring divider** (26 compare-subtract steps on the significands, no multiplier) instead of Newton-Raphson, and is bit-exact. `Iteration.v` is kept in the repository (for any project file list that still references it) but is no longer instantiated.
+6. **`Division.v`: wrong Newton-Raphson seed** (`−37/17` instead of `−32/17`) made ~46% of cases with a mantissa ≥ 1.875 wrong by hundreds of ULP, and even corrected the method still lost 2–4 ULP per division because every adder/multiplier inside the 3 iterations truncated. **Division.v now uses an exact restoring divider** (26 compare-subtract steps on the significands, no multiplier) instead of Newton-Raphson, and is bit-exact.
 7. **Inf/NaN inputs returned 0** on add, subtract and multiply; now NaN → qNaN (`0x7FC00000`), `Inf − Inf` → NaN, `0 × Inf` → NaN, and finite ± Inf propagate correctly, matching IEEE 754.
 8. **Subnormal numbers were not supported** — every unit now treats exponent 0 as hidden-bit-0 / exponent 1 on input, and `fp_round_pack` produces gradual underflow (a subnormal result) instead of flushing to zero or garbage.
 9. **`ALU.v`: opcodes 3 and 10 did not force `AddBar_Sub`** — subtract (3) and add (10) simply followed the `AddBar_Sub` pin like opcode 0; they now force it.

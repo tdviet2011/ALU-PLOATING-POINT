@@ -24,8 +24,6 @@
 //   (0 DSP blocks), returns bit-exact IEEE results and handles subnormals.
 //   Its drawback is the same as any combinational divider: a long carry chain
 //   (26 sequential 25-bit subtractors); pipeline it if timing is critical.
-//   Iteration.v is no longer instantiated (kept only so existing project file
-//   lists stay valid).
 //
 // Port order: a, b, Exception, result; Overflow/Underflow are new (last).
 //==============================================================================
