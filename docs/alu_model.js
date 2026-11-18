@@ -51,7 +51,7 @@
     var ea = ex(a), eb = ex(b);
     var exception = (ea === 255 || eb === 255);
     var aNan = isNan(a), bNan = isNan(b), aInf = isInf(a), bInf = isInf(b);
-    if (aNan || bNan) return { result: 0x7fc00000, exception: exception, overflow: false, underflow: false };
+    if (aNan || bNan) return { result: (aNan ? (a | 0x00400000) : (b | 0x00400000)) >>> 0, exception: exception, overflow: false, underflow: false };
     if (aInf && bInf) {
       if (sa !== sb) return { result: 0x7fc00000, exception: exception, overflow: false, underflow: false };
       return { result: ((sa << 31) | 0x7f800000) >>> 0, exception: exception, overflow: false, underflow: false };
@@ -99,7 +99,9 @@
     var exception = (ea === 255 || eb === 255);
     var aNan = isNan(a), bNan = isNan(b), aInf = isInf(a), bInf = isInf(b);
     var aZero = (a & 0x7fffffff) === 0, bZero = (b & 0x7fffffff) === 0;
-    if (aNan || bNan || (aInf && bZero) || (bInf && aZero))
+    if (aNan || bNan)
+      return { result: (aNan ? (a | 0x00400000) : (b | 0x00400000)) >>> 0, exception: exception, overflow: false, underflow: false };
+    if ((aInf && bZero) || (bInf && aZero))
       return { result: 0x7fc00000, exception: exception, overflow: false, underflow: false };
     if (aInf || bInf) return { result: ((sign << 31) | 0x7f800000) >>> 0, exception: exception, overflow: false, underflow: false };
     if (aZero || bZero) return { result: (sign << 31) >>> 0, exception: exception, overflow: false, underflow: false };
@@ -123,7 +125,9 @@
     var exception = (ea === 255 || eb === 255);
     var aNan = isNan(a), bNan = isNan(b), aInf = isInf(a), bInf = isInf(b);
     var aZero = (a & 0x7fffffff) === 0, bZero = (b & 0x7fffffff) === 0;
-    if (aNan || bNan || (aZero && bZero) || (aInf && bInf))
+    if (aNan || bNan)
+      return { result: (aNan ? (a | 0x00400000) : (b | 0x00400000)) >>> 0, exception: exception, overflow: false, underflow: false };
+    if ((aZero && bZero) || (aInf && bInf))
       return { result: 0x7fc00000, exception: exception, overflow: false, underflow: false };
     if (aInf) return { result: ((sign << 31) | 0x7f800000) >>> 0, exception: exception, overflow: false, underflow: false };
     if (bInf) return { result: (sign << 31) >>> 0, exception: exception, overflow: false, underflow: false };

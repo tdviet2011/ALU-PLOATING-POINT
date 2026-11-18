@@ -68,10 +68,16 @@ module Multiplication(
     fp_round_pack #(48) rp (.sign(sign), .e(e), .n(pn),
                             .result(packed_res), .overflow(pk_of), .underflow(pk_uf));
 
-    wire invalid = a_nan | b_nan | (a_inf & b_zero) | (b_inf & a_zero);   // Inf * 0
-    wire special = invalid | a_inf | b_inf | a_zero | b_zero;
+    wire nan_in    = a_nan | b_nan;
+    wire zero_inf  = (a_inf & b_zero) | (b_inf & a_zero);   // Inf * 0
+    wire special   = nan_in | zero_inf | a_inf | b_inf | a_zero | b_zero;
 
-    assign result = invalid          ? 32'h7FC00000 :
+    // Propagate the payload of an input NaN (quieted), a_operand wins when
+    // both operands are NaN -- see ADD_SUB.v for the same convention.
+    wire [31:0] nan_prop = a_nan ? (a_operand | 32'h0040_0000) : (b_operand | 32'h0040_0000);
+
+    assign result = nan_in           ? nan_prop :
+                    zero_inf         ? 32'h7FC00000 :
                     (a_inf | b_inf)  ? {sign, 8'hFF, 23'd0} :
                     (a_zero | b_zero)? {sign, 31'd0} :
                                        packed_res;

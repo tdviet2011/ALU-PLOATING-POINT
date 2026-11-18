@@ -32,10 +32,16 @@ def f32(x):
 NAN = 0x7FC00000
 
 
+def nan_prop(a, b, A, B):
+    """Quieted payload of the NaN operand (a wins when both are NaN), matching
+    ADD_SUB.v/Multiplication.v/Division.v's nan_prop convention."""
+    return (a | 0x00400000) if math.isnan(A) else (b | 0x00400000)
+
+
 def ref_addsub(a, b, sub):
     A, B = h2f(a), h2f(b)
     if math.isnan(A) or math.isnan(B):
-        return NAN
+        return nan_prop(a, b, A, B)
     Bv = -B if sub else B
     if math.isinf(A) and math.isinf(Bv):
         return NAN if A != Bv else f2h(A)
@@ -49,7 +55,7 @@ def ref_addsub(a, b, sub):
 def ref_mul(a, b):
     A, B = h2f(a), h2f(b)
     if math.isnan(A) or math.isnan(B):
-        return NAN
+        return nan_prop(a, b, A, B)
     if (math.isinf(A) and B == 0) or (math.isinf(B) and A == 0):
         return NAN
     return f2h(f32(A * B))
@@ -58,7 +64,7 @@ def ref_mul(a, b):
 def ref_div(a, b):
     A, B = h2f(a), h2f(b)
     if math.isnan(A) or math.isnan(B):
-        return NAN
+        return nan_prop(a, b, A, B)
     if (A == 0 and B == 0) or (math.isinf(A) and math.isinf(B)):
         return NAN
     if math.isinf(A):

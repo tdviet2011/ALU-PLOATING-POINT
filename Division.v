@@ -103,15 +103,21 @@ module Division(
                             .result(packed_res), .overflow(pk_of), .underflow(pk_uf));
 
     //------------------------------------------------------------ result mux
-    wire invalid = a_nan | b_nan | (a_zero & b_zero) | (a_inf & b_inf);
-    wire special = invalid | a_inf | b_inf | a_zero | b_zero;
+    wire nan_in    = a_nan | b_nan;
+    wire zz_or_ii  = (a_zero & b_zero) | (a_inf & b_inf);   // 0/0, Inf/Inf
+    wire special   = nan_in | zz_or_ii | a_inf | b_inf | a_zero | b_zero;
 
-    assign result = invalid ? 32'h7FC00000 :
-                    a_inf   ? {sign, 8'hFF, 23'd0} :     // Inf / x
-                    b_inf   ? {sign, 31'd0}        :     // x / Inf
-                    b_zero  ? {sign, 8'hFF, 23'd0} :     // x / 0
-                    a_zero  ? {sign, 31'd0}        :     // 0 / x
-                              packed_res;
+    // Propagate the payload of an input NaN (quieted), a_operand wins when
+    // both operands are NaN -- see ADD_SUB.v for the same convention.
+    wire [31:0] nan_prop = a_nan ? (a_operand | 32'h0040_0000) : (b_operand | 32'h0040_0000);
+
+    assign result = nan_in   ? nan_prop :
+                    zz_or_ii ? 32'h7FC00000 :
+                    a_inf    ? {sign, 8'hFF, 23'd0} :     // Inf / x
+                    b_inf    ? {sign, 31'd0}        :     // x / Inf
+                    b_zero   ? {sign, 8'hFF, 23'd0} :     // x / 0
+                    a_zero   ? {sign, 31'd0}        :     // 0 / x
+                               packed_res;
 
     assign Overflow  = ~special & pk_of;
     assign Underflow = ~special & pk_uf;

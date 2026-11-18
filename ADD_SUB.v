@@ -97,14 +97,22 @@ module Addition_Subtraction(
     //------------------------------------------------------------ result mux
     // exact zero: +0, except (-0) + (-0) = -0
     wire zero_sign = eff_sub ? 1'b0 : sx;
-    wire invalid   = a_nan | b_nan | (a_inf & b_inf & (sa != sb));   // Inf - Inf
-    wire special   = invalid | a_inf | b_inf;
+    wire nan_in       = a_nan | b_nan;
+    wire inf_minus_inf= a_inf & b_inf & (sa != sb);
+    wire special       = nan_in | inf_minus_inf | a_inf | b_inf;
 
-    assign result = invalid ? 32'h7FC00000 :
-                    a_inf   ? {sa, 8'hFF, 23'd0} :
-                    b_inf   ? {sb, 8'hFF, 23'd0} :
-                    r_zero  ? {zero_sign, 31'd0} :
-                              packed_res;
+    // Propagate the payload of an input NaN (quieted: force the MSB of the
+    // mantissa to 1) instead of always returning the same fixed NaN bit
+    // pattern. a_operand wins when both operands are NaN -- IEEE 754 leaves
+    // this choice to the implementation.
+    wire [31:0] nan_prop = a_nan ? (a_operand | 32'h0040_0000) : (b_operand | 32'h0040_0000);
+
+    assign result = nan_in        ? nan_prop :
+                    inf_minus_inf ? 32'h7FC00000 :
+                    a_inf         ? {sa, 8'hFF, 23'd0} :
+                    b_inf         ? {sb, 8'hFF, 23'd0} :
+                    r_zero        ? {zero_sign, 31'd0} :
+                                     packed_res;
 
     assign Overflow  = ~special & ~r_zero & pk_of;
     assign Underflow = ~special & ~r_zero & pk_uf;
